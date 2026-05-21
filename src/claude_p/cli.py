@@ -163,6 +163,8 @@ def extract_assistant_snapshot(transcript: str) -> str:
 def classify_failure(transcript: str, assistant_text: str, timed_out: bool) -> str | None:
     interactive_block = classify_interactive_block(f"{transcript}\n{assistant_text}")
     if interactive_block:
+        if assistant_text and interactive_block == "workspace_trust_blocked":
+            return None
         return interactive_block
     if assistant_text:
         return None
@@ -370,6 +372,7 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     last_snapshot = ""
     last_jsonl_poll = 0.0
     timed_out = True
+    trust_sent = False
 
     try:
         while time.time() - start < args.timeout_sec:
@@ -418,9 +421,19 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                     last_snapshot = snapshot
 
             transcript = raw.decode("utf-8", "replace")
-            if classify_interactive_block(transcript):
-                timed_out = False
-                break
+            block_type = classify_interactive_block(transcript)
+            if block_type:
+                if block_type == "workspace_trust_blocked" and args.trust_workspace and not trust_sent:
+                    os.write(master, b"1\n")
+                    trust_sent = True
+                    last_output = time.time()
+                    continue
+
+                if block_type == "workspace_trust_blocked" and trust_sent:
+                    pass
+                else:
+                    timed_out = False
+                    break
 
             # The terminal surface is not a stable completion signal across
             # Claude Code versions and terminal modes. Poll the canonical
@@ -586,6 +599,11 @@ def main() -> int:
         "--live-tui-deltas",
         action="store_true",
         help="Emit live text deltas from the lossy TUI surface. Default buffers until persisted JSONL final text is available.",
+    )
+    parser.add_argument(
+        "--trust-workspace",
+        action="store_true",
+        help="Automatically trust the workspace if prompted by Claude Code.",
     )
     args = parser.parse_args()
     recover_prompt_from_variadic_args(args)

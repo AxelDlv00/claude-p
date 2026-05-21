@@ -34,6 +34,7 @@ class ClaudePOptions:
     quiet_after_sec: float = 3
     raw_log: str | None = None
     include_partial_messages: bool = True
+    trust_workspace: bool = False
     executable: str | None = None
     extra_args: list[str] = field(default_factory=list)
 
@@ -71,6 +72,8 @@ class ClaudePOptions:
             cmd.extend(["--raw-log", self.raw_log])
         if self.include_partial_messages:
             cmd.append("--include-partial-messages")
+        if self.trust_workspace:
+            cmd.append("--trust-workspace")
         cmd.extend(self.extra_args)
         return cmd
 

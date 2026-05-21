@@ -96,6 +96,7 @@ prompts, auth problems, rate limits, MCP startup failures, or other local blocks
 - `--permission-mode`
 - `--output-format text|json|stream-json`
 - `--include-partial-messages`
+- `--trust-workspace`
 - `--session-id`
 - `--cwd`
 - common context/config flags such as `--system-prompt`,
@@ -415,6 +416,7 @@ MCP 启动失败或其他本地阻塞。不要只看表层“没输出”。
 - `--permission-mode`
 - `--output-format text|json|stream-json`
 - `--include-partial-messages`
+- `--trust-workspace`
 - `--session-id`
 - `--cwd`
 - 常见上下文和配置参数，例如 `--system-prompt`、`--append-system-prompt`、
