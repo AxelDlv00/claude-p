@@ -191,9 +191,22 @@ def classify_interactive_block(text: str) -> str | None:
     return None
 
 
+def _iteration_from_api_usage(api_usage: dict) -> dict:
+    return {
+        "input_tokens": api_usage.get("input_tokens"),
+        "output_tokens": api_usage.get("output_tokens"),
+        "cache_read_input_tokens": api_usage.get("cache_read_input_tokens"),
+        "cache_creation_input_tokens": api_usage.get("cache_creation_input_tokens"),
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": None,
+            "ephemeral_1h_input_tokens": None,
+        },
+        "type": "message",
+    }
+
+
 def build_usage(output_text: str) -> dict:
-    # The TUI does not expose reliable token/cost data. Keep shape-compatible
-    # fields with null/zero values and mark the source in result metadata.
+    # Fallback when no JSONL data is available: shape-compatible with null values.
     approx_output_tokens = max(1, len(output_text.split()))
     return {
         "input_tokens": None,
@@ -216,6 +229,46 @@ def build_usage(output_text: str) -> dict:
                 "type": "message",
             }
         ],
+        "speed": None,
+    }
+
+
+def build_usage_from_events(events: list[dict]) -> dict:
+    """Build a claude -p compatible usage object from all JSONL assistant events.
+
+    Each assistant event in the JSONL corresponds to one turn (including
+    intermediate tool-use turns). We sum across all turns for the totals and
+    expose per-turn data in the iterations array, matching the shape that
+    claude -p --output-format stream-json produces.
+    """
+    iterations = []
+    total: dict[str, int] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    for event in events:
+        message = event.get("message", {})
+        api_usage = message.get("usage")
+        if not isinstance(api_usage, dict):
+            continue
+        for key in total:
+            total[key] += api_usage.get(key) or 0
+        iterations.append(_iteration_from_api_usage(api_usage))
+
+    if not iterations:
+        return build_usage("")
+
+    return {
+        "input_tokens": total["input_tokens"] or None,
+        "cache_creation_input_tokens": total["cache_creation_input_tokens"] or None,
+        "cache_read_input_tokens": total["cache_read_input_tokens"] or None,
+        "output_tokens": total["output_tokens"] or None,
+        "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+        "service_tier": None,
+        "cache_creation": {"ephemeral_1h_input_tokens": None, "ephemeral_5m_input_tokens": None},
+        "iterations": iterations,
         "speed": None,
     }
 
@@ -258,8 +311,46 @@ def is_terminal_assistant_message(message: dict) -> bool:
     return stop_reason is not None and stop_reason not in NON_TERMINAL_STOP_REASONS
 
 
+def _find_session_jsonl(session_id: str) -> Path | None:
+    pattern = str(Path.home() / ".claude" / "projects" / "**" / f"{session_id}.jsonl")
+    paths = [Path(p) for p in glob.glob(pattern, recursive=True)]
+    if not paths:
+        return None
+    return max(paths, key=lambda p: p.stat().st_mtime)
+
+
+def read_all_assistant_events(session_id: str) -> list[dict]:
+    """Read all assistant events from the session JSONL in order.
+
+    Interactive Claude Code writes the same canonical JSONL as claude -p.
+    Each assistant event covers one turn (text response or tool-use turn).
+    Reading all of them lets us compute accurate multi-turn usage totals and
+    a correct num_turns count.
+    """
+    path = _find_session_jsonl(session_id)
+    if path is None:
+        return []
+    events: list[dict] = []
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "assistant":
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict):
+                    continue
+                events.append(event)
+    except OSError:
+        pass
+    return events
+
+
 def read_persisted_assistant(session_id: str, *, require_terminal: bool = False) -> dict | None:
-    """Read Claude Code's persisted JSONL for exact final assistant text.
+    """Read Claude Code's persisted JSONL for the final assistant message.
 
     The interactive terminal is a lossy rendering surface: wide glyphs, cursor
     redraws, and spinner updates can drop or smear characters in the captured
@@ -267,11 +358,9 @@ def read_persisted_assistant(session_id: str, *, require_terminal: bool = False)
     interactive sessions. When available, use it as the source of truth for the
     final assistant message while keeping the TUI transcript as provenance.
     """
-    pattern = str(Path.home() / ".claude" / "projects" / "**" / f"{session_id}.jsonl")
-    paths = [Path(p) for p in glob.glob(pattern, recursive=True)]
-    if not paths:
+    path = _find_session_jsonl(session_id)
+    if path is None:
         return None
-    path = max(paths, key=lambda p: p.stat().st_mtime)
     latest: dict | None = None
     try:
         with path.open() as f:
@@ -602,8 +691,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--trust-workspace",
-        action="store_true",
-        help="Automatically trust the workspace if prompted by Claude Code.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically trust the workspace if prompted by Claude Code (default: true).",
     )
     args = parser.parse_args()
     recover_prompt_from_variadic_args(args)
@@ -716,6 +806,7 @@ def main() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(transcript)
 
+    all_assistant_events = read_all_assistant_events(args.session_id)
     persisted = read_persisted_assistant(args.session_id, require_terminal=True)
     answer = persisted["text"] if persisted else tui_answer
     final_answer_source = "session_jsonl" if persisted else "tui_transcript"
@@ -726,6 +817,13 @@ def main() -> int:
             final_answer_source = "json_canonicalized_from_matching_tui_and_session_jsonl"
     final_model = persisted.get("model") if persisted else args.model
     message_id = persisted.get("message_id") if persisted and persisted.get("message_id") else message_id
+
+    # num_turns: each assistant event is one turn; tool-use rounds have
+    # stop_reason "tool_use", the final response has "end_turn".
+    num_turns = len(all_assistant_events) if all_assistant_events else 1
+
+    # usage: real token data from JSONL, falling back to word-count estimate.
+    usage = build_usage_from_events(all_assistant_events) if all_assistant_events else build_usage(answer)
 
     if answer and not args.live_tui_deltas:
         emit(
@@ -745,7 +843,6 @@ def main() -> int:
 
     failure = classify_failure(transcript, answer, timed_out)
     is_error = failure is not None
-    usage = build_usage(answer)
     duration_ms = now_ms(start)
 
     if args.output_format == "text":
@@ -770,7 +867,7 @@ def main() -> int:
                     "is_error": is_error,
                     "duration_ms": duration_ms,
                     "duration_api_ms": None,
-                    "num_turns": 1,
+                    "num_turns": num_turns,
                     "result": answer,
                     "session_id": args.session_id,
                     "total_cost_usd": None,
@@ -872,7 +969,7 @@ def main() -> int:
             "api_error_status": None,
             "duration_ms": duration_ms,
             "duration_api_ms": None,
-            "num_turns": 1,
+            "num_turns": num_turns,
             "result": answer,
             "stop_reason": "end_turn" if not is_error else None,
             "session_id": args.session_id,

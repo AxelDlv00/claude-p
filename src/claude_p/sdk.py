@@ -21,7 +21,9 @@ class ClaudePOptions:
     cwd: str | None = None
     model: str = "sonnet"
     tools: str | Iterable[str] = "default"
-    permission_mode: str = "default"
+    # bypassPermissions avoids blocking on tool approval prompts, matching
+    # claude -p behaviour where no interactive permission dialog is shown.
+    permission_mode: str = "bypassPermissions"
     output_format: str = "stream-json"
     system_prompt: str | None = None
     append_system_prompt: str | None = None
@@ -34,7 +36,8 @@ class ClaudePOptions:
     quiet_after_sec: float = 3
     raw_log: str | None = None
     include_partial_messages: bool = True
-    trust_workspace: bool = False
+    # Auto-accept the workspace trust dialog so sessions never block unattended.
+    trust_workspace: bool = True
     executable: str | None = None
     extra_args: list[str] = field(default_factory=list)
 
