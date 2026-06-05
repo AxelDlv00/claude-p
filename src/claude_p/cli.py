@@ -311,8 +311,13 @@ def is_terminal_assistant_message(message: dict) -> bool:
     return stop_reason is not None and stop_reason not in NON_TERMINAL_STOP_REASONS
 
 
+def _claude_config_dir() -> Path:
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env) if env else Path.home() / ".claude"
+
+
 def _find_session_jsonl(session_id: str) -> Path | None:
-    pattern = str(Path.home() / ".claude" / "projects" / "**" / f"{session_id}.jsonl")
+    pattern = str(_claude_config_dir() / "projects" / "**" / f"{session_id}.jsonl")
     paths = [Path(p) for p in glob.glob(pattern, recursive=True)]
     if not paths:
         return None
@@ -395,6 +400,67 @@ def read_persisted_assistant(session_id: str, *, require_terminal: bool = False)
     return latest
 
 
+def _drain_session_events(session_id: str, state: dict, stream_json: bool) -> None:
+    """Echo new canonical assistant/user events from the session JSONL.
+
+    Claude Code persists each turn to ``~/.claude/projects/**/<sid>.jsonl``
+    in the same shape ``claude -p --output-format stream-json`` produces:
+    ``assistant`` events carry text / thinking / tool_use content blocks,
+    and ``user`` events carry tool_result blocks. Re-emitting each new line
+    as it lands gives a downstream stream-json consumer FULL live logging —
+    tool calls and their results, not just scraped terminal text.
+
+    ``state`` is a caller-owned dict ({} initially) that tracks the located
+    file and a byte offset, so each line is emitted exactly once across
+    repeated calls. Only complete (newline-terminated) lines are emitted;
+    a trailing partial line is left for the next drain.
+
+    ``user`` events are emitted only when their ``message.content`` is a
+    list (tool-result turns) — the initial human prompt is a string-content
+    ``user`` event, which both isn't useful downstream and would break
+    consumers that iterate ``content`` expecting blocks.
+    """
+    if state.get("path") is None:
+        path = _find_session_jsonl(session_id)
+        if path is None:
+            return
+        state["path"] = path
+        state["offset"] = 0
+    path = state["path"]
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= state.get("offset", 0):
+        return
+    try:
+        with path.open("rb") as f:
+            f.seek(state.get("offset", 0))
+            chunk = f.read()
+    except OSError:
+        return
+    last_nl = chunk.rfind(b"\n")
+    if last_nl == -1:
+        return
+    complete = chunk[: last_nl + 1]
+    state["offset"] = state.get("offset", 0) + len(complete)
+    for raw_line in complete.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        etype = event.get("type")
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        if etype == "assistant":
+            emit(event, enabled=stream_json)
+        elif etype == "user" and isinstance(message.get("content"), list):
+            emit(event, enabled=stream_json)
+
+
 def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int | None, bool, float]:
     cmd = ["claude", "--session-id", args.session_id]
 
@@ -462,6 +528,24 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     last_jsonl_poll = 0.0
     timed_out = True
     trust_sent = False
+    # --stream-session-events: tail Claude Code's session JSONL and echo
+    # each new canonical assistant/user event live, for full downstream
+    # logging (tool calls + results, not just terminal text deltas).
+    stream_session_events = getattr(args, "stream_session_events", False)
+    session_tail: dict = {}
+
+    # Mirror the PTY to --raw-log incrementally (flushed per chunk) so a
+    # `tail -f` on it shows the live interactive screen. Without this the
+    # transcript is only written once the session ends, which is useless
+    # for diagnosing a run that's still in progress or wedged on a prompt.
+    raw_fh = None
+    if args.raw_log:
+        try:
+            p = Path(args.raw_log)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            raw_fh = open(p, "wb", buffering=0)
+        except OSError:
+            raw_fh = None
 
     try:
         while time.time() - start < args.timeout_sec:
@@ -475,6 +559,11 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                 if not data:
                     break
                 raw.extend(data)
+                if raw_fh is not None:
+                    try:
+                        raw_fh.write(data)
+                    except OSError:
+                        pass
                 last_output = time.time()
 
                 if args.emit_terminal_delta:
@@ -490,7 +579,10 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
 
                 snapshot = extract_assistant_snapshot(raw.decode("utf-8", "replace"))
                 if snapshot and snapshot != last_snapshot:
-                    if args.live_tui_deltas:
+                    # --stream-session-events supersedes terminal-scraped
+                    # text deltas with real session events (below), so don't
+                    # also emit the lower-fidelity scrape.
+                    if args.live_tui_deltas and not stream_session_events:
                         delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
                         if delta.strip():
                             emit(
@@ -531,6 +623,8 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
             # can also contain text and must not be mistaken for final output.
             if now - last_jsonl_poll >= 0.5:
                 last_jsonl_poll = now
+                if stream_session_events:
+                    _drain_session_events(args.session_id, session_tail, stream_json)
                 persisted = read_persisted_assistant(args.session_id)
                 if persisted and persisted.get("text") and persisted.get("terminal"):
                     timed_out = False
@@ -552,6 +646,17 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
             except subprocess.TimeoutExpired:
                 proc.kill()
         os.close(master)
+        if raw_fh is not None:
+            try:
+                raw_fh.close()
+            except OSError:
+                pass
+
+    # Final drain: claude persists the terminal assistant turn before the
+    # loop's break condition fires, but flush any remaining new events once
+    # more so the last assistant/tool_result event is guaranteed emitted.
+    if stream_session_events:
+        _drain_session_events(args.session_id, session_tail, stream_json)
 
     transcript = clean_terminal(raw.decode("utf-8", "replace"))
     answer = extract_assistant_snapshot(transcript)
@@ -583,7 +688,7 @@ def doctor(args: argparse.Namespace) -> int:
         except Exception as exc:  # pragma: no cover - defensive diagnostic path.
             print(f"claude_version_error: {exc}")
 
-    session_root = Path.home() / ".claude" / "projects"
+    session_root = _claude_config_dir() / "projects"
     print(f"session_root: {session_root}")
     print(f"session_root_exists: {session_root.exists()}")
     print(f"session_root_writable: {os.access(session_root, os.W_OK) if session_root.exists() else False}")
@@ -688,6 +793,17 @@ def main() -> int:
         "--live-tui-deltas",
         action="store_true",
         help="Emit live text deltas from the lossy TUI surface. Default buffers until persisted JSONL final text is available.",
+    )
+    parser.add_argument(
+        "--stream-session-events",
+        action="store_true",
+        help=(
+            "Tail Claude Code's session JSONL and echo each new canonical "
+            "assistant/user event (text, tool_use, tool_result) live, in the "
+            "same stream-json shape as `claude -p`. Gives a downstream "
+            "consumer full live logging (tool calls + results), not just "
+            "scraped terminal text. Supersedes --live-tui-deltas when set."
+        ),
     )
     parser.add_argument(
         "--trust-workspace",
@@ -801,10 +917,7 @@ def main() -> int:
     )
 
     transcript, tui_answer, exit_code, timed_out, run_start = run_tui(args, stream_json)
-    if args.raw_log:
-        path = Path(args.raw_log)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(transcript)
+    # run_tui mirrors the PTY to --raw-log live; no end-of-run write needed.
 
     all_assistant_events = read_all_assistant_events(args.session_id)
     persisted = read_persisted_assistant(args.session_id, require_terminal=True)
@@ -825,7 +938,7 @@ def main() -> int:
     # usage: real token data from JSONL, falling back to word-count estimate.
     usage = build_usage_from_events(all_assistant_events) if all_assistant_events else build_usage(answer)
 
-    if answer and not args.live_tui_deltas:
+    if answer and not args.live_tui_deltas and not args.stream_session_events:
         emit(
             {
                 "type": "stream_event",
@@ -889,7 +1002,11 @@ def main() -> int:
         )
         return 0 if not is_error else 2
 
-    emit(
+    # When streaming real session events, the terminal assistant turn was
+    # already emitted live from the session JSONL — don't re-emit a
+    # synthetic copy (it would duplicate the final text downstream).
+    if not args.stream_session_events:
+      emit(
         {
             "type": "assistant",
             "message": {
