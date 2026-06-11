@@ -16,6 +16,7 @@ Compatibility target:
 from __future__ import annotations
 
 import argparse
+import atexit
 import glob
 import json
 import os
@@ -27,6 +28,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -314,6 +316,45 @@ def is_terminal_assistant_message(message: dict) -> bool:
 def _claude_config_dir() -> Path:
     env = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(env) if env else Path.home() / ".claude"
+
+
+# Per-session / per-instance state that two concurrent `claude` TUIs must NOT
+# share. When a second claude runs on the same CLAUDE_CONFIG_DIR as a still-live
+# first one, it fails to persist its session (only the early `ai-title` lands in
+# `projects/**/<sid>.jsonl`), so --stream-session-events has nothing to tail and
+# downstream logging is empty even though the run completes. Isolating just
+# these — and symlinking everything else — fixes persistence with no heavy copy.
+_ISOLATED_STATE = frozenset({
+    "projects",        # session JSONL store — THE one that must be per-instance
+    "sessions", "session-env", "ide", "shell-snapshots",
+    "file-history", "history.jsonl", "tasks", "todos",
+})
+
+
+def _isolate_config_dir() -> None:
+    """Point CLAUDE_CONFIG_DIR at a throwaway dir that symlinks the base config
+    (auth, plugins, caches, settings — shared, so startup stays fast and
+    authenticated) but keeps a FRESH session store, so this claude can run
+    concurrently with another on the base dir without the session-persistence
+    clash. Old sessions aren't preserved — the point is that new ones persist.
+    Set before anything reads the config dir; cleaned up at exit."""
+    base = _claude_config_dir()
+    if not base.exists():
+        return
+    iso = Path(tempfile.mkdtemp(prefix="claude-p-cfg-"))
+    for entry in base.iterdir():
+        dst = iso / entry.name
+        if entry.name in _ISOLATED_STATE:
+            continue  # absent → claude creates a fresh per-instance copy
+        try:
+            if entry.name == ".claude.json":
+                shutil.copy2(entry, dst)  # writable per-instance (onboarding/trust flags)
+            else:
+                os.symlink(entry, dst)    # auth / plugins / caches / settings shared (read)
+        except OSError:
+            pass
+    os.environ["CLAUDE_CONFIG_DIR"] = str(iso)
+    atexit.register(lambda: shutil.rmtree(iso, ignore_errors=True))
 
 
 def _find_session_jsonl(session_id: str) -> Path | None:
@@ -811,8 +852,24 @@ def main() -> int:
         default=True,
         help="Automatically trust the workspace if prompted by Claude Code (default: true).",
     )
+    parser.add_argument(
+        "--isolate-config-dir",
+        action="store_true",
+        help=(
+            "Run this claude in a throwaway CLAUDE_CONFIG_DIR that symlinks the "
+            "base dir's auth/plugins/caches but keeps a fresh session store. "
+            "Lets several claude-p TUIs run concurrently (e.g. a dispatcher + "
+            "its subagents) without the shared-config-dir clash that otherwise "
+            "stops the non-first session from persisting (leaving "
+            "--stream-session-events empty)."
+        ),
+    )
     args = parser.parse_args()
     recover_prompt_from_variadic_args(args)
+
+    # Must run before anything reads the config dir (session discovery, env).
+    if getattr(args, "isolate_config_dir", False):
+        _isolate_config_dir()
 
     if args.doctor:
         return doctor(args)
