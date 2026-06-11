@@ -508,6 +508,12 @@ def _drain_session_events(session_id: str, state: dict, stream_json: bool) -> No
             state["emitted"] = state.get("emitted", 0) + 1
 
 
+# Throttle for the child-session liveness heartbeat (see run_tui). Long enough
+# that a multi-minute subagent emits a readable handful of "still active" pings
+# rather than a flood, short enough that the consumer sees it's alive.
+_CHILD_HEARTBEAT_SEC = 20.0
+
+
 def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int | None, bool, float]:
     cmd = ["claude", "--session-id", args.session_id]
 
@@ -580,11 +586,11 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     # CLAUDE_CODE_CHILD_SESSION=1 into our environment — and that very flag is
     # why Claude Code declines to persist this session's transcript JSONL (only
     # the out-of-band ai-title lands). So --stream-session-events has nothing to
-    # tail. The same flag therefore tells us, reliably and from the first
-    # instant, that we must fall back to the live terminal scrape to give the
-    # consumer any output. A normal top-level run never has it, so it never
-    # falls back and never double-emits.
+    # tail. The same flag tells us, reliably and from the first instant, to emit
+    # the liveness heartbeat (below) so the consumer still sees activity. A
+    # normal top-level run never has it, so it never heartbeats.
     is_child_session = bool(os.environ.get("CLAUDE_CODE_CHILD_SESSION"))
+    last_heartbeat = 0.0
     # --stream-session-events: tail Claude Code's session JSONL and echo
     # each new canonical assistant/user event live, for full downstream
     # logging (tool calls + results, not just terminal text deltas).
@@ -623,6 +629,44 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                         pass
                 last_output = time.time()
 
+                # A child/subagent session's transcript is never persisted by
+                # Claude Code (see is_child_session above), so
+                # --stream-session-events has nothing to tail. Dumping the raw,
+                # cursor-smeared terminal scrape into the downstream log is
+                # unreadable — instead emit a throttled liveness HEARTBEAT so the
+                # consumer can see the subagent is alive and producing output
+                # while structured events are unavailable. The full screen is
+                # still captured in --raw-log, and the final scraped answer still
+                # lands in the `result` event. Stops once a real session event
+                # is emitted (a non-child session that does persist).
+                if (
+                    is_child_session
+                    and stream_session_events
+                    and session_tail.get("emitted", 0) == 0
+                    and time.time() - last_heartbeat >= _CHILD_HEARTBEAT_SEC
+                ):
+                    last_heartbeat = time.time()
+                    emit(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "text",
+                                    "text": (
+                                        f"⏳ subagent active — {int(time.time() - start)}s, "
+                                        f"{len(raw) // 1024} KB of output so far "
+                                        "(live structured log isn't available for this nested "
+                                        "session; the full transcript is in the raw log)"
+                                    ),
+                                }],
+                            },
+                            "session_id": args.session_id,
+                            "uuid": str(uuid.uuid4()),
+                        },
+                        enabled=stream_json,
+                    )
+
                 if args.emit_terminal_delta:
                     emit(
                         {
@@ -634,49 +678,17 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                         enabled=stream_json,
                     )
 
+                # Track the latest assistant snapshot for completion detection
+                # (last_snapshot, below) and the final scraped answer. Emit it as
+                # a live text delta ONLY in --live-tui-deltas mode; under
+                # --stream-session-events the canonical session events supersede
+                # it, and a child session gets the heartbeat above instead of an
+                # unreadable scrape.
                 snapshot = extract_assistant_snapshot(raw.decode("utf-8", "replace"))
                 if snapshot and snapshot != last_snapshot:
-                    # --stream-session-events supersedes terminal-scraped text
-                    # deltas with real session events (below), so normally don't
-                    # also emit the lower-fidelity scrape. BUT a child/subagent
-                    # session's transcript is never persisted (see
-                    # is_child_session above), so the tail emits nothing and the
-                    # downstream log stays silent even though the agent is
-                    # plainly working. In that case fall back to the live
-                    # terminal scrape — the same surface the interactive screen
-                    # renders. The emitted guard means that if a real session
-                    # event ever does land we stop scraping and never double-emit.
-                    session_events_silent = (
-                        stream_session_events
-                        and is_child_session
-                        and session_tail.get("emitted", 0) == 0
-                    )
-                    delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
-                    if delta.strip():
-                        if session_events_silent:
-                            # Surface the scraped terminal text as a canonical
-                            # `assistant` event (not a stream_event delta): a
-                            # consumer that drives claude-p with
-                            # --stream-session-events parses the session-event
-                            # shape (assistant/user/result) and would drop a
-                            # stream_event, so the live_tui_deltas shape used
-                            # below wouldn't reach it. Emitting the incremental
-                            # delta as an assistant text block gives that
-                            # consumer live subagent output in the shape it
-                            # already understands.
-                            emit(
-                                {
-                                    "type": "assistant",
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": [{"type": "text", "text": delta}],
-                                    },
-                                    "session_id": args.session_id,
-                                    "uuid": str(uuid.uuid4()),
-                                },
-                                enabled=stream_json,
-                            )
-                        elif args.live_tui_deltas and not stream_session_events:
+                    if args.live_tui_deltas and not stream_session_events:
+                        delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
+                        if delta.strip():
                             emit(
                                 {
                                     "type": "stream_event",
