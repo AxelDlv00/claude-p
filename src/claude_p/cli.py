@@ -365,6 +365,38 @@ def _find_session_jsonl(session_id: str) -> Path | None:
     return max(paths, key=lambda p: p.stat().st_mtime)
 
 
+def _session_transcript_is_live(session_id: str) -> bool:
+    """True once Claude Code is actually persisting this session's transcript.
+
+    A normal top-level session writes startup events (``mode``,
+    ``permission-mode``, the human ``user`` prompt, …) to
+    ``projects/**/<sid>.jsonl`` within a second or two of launch, well before
+    the first model response. A *child* session (claude-p spawned inside
+    another Claude Code, e.g. a subagent) is one Claude Code declines to
+    persist: its JSONL only ever receives the out-of-band ``ai-title``. So
+    "the file has any event other than ai-title" is a reliable, early signal
+    that --stream-session-events will have real data to tail — and its
+    negation tells run_tui to fall back to the live terminal scrape."""
+    path = _find_session_jsonl(session_id)
+    if path is None:
+        return False
+    try:
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    etype = json.loads(line).get("type")
+                except json.JSONDecodeError:
+                    continue
+                if etype and etype != "ai-title":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def read_all_assistant_events(session_id: str) -> list[dict]:
     """Read all assistant events from the session JSONL in order.
 
@@ -502,6 +534,16 @@ def _drain_session_events(session_id: str, state: dict, stream_json: bool) -> No
             emit(event, enabled=stream_json)
 
 
+# How long to wait for --stream-session-events to produce a real event before
+# concluding the session JSONL isn't being persisted (a nested subagent: Claude
+# Code doesn't persist a child session's transcript) and falling back to the
+# live terminal scrape. Generous on purpose: a normal top-level run lands its
+# first session event well within this, so the fallback never fires for it and
+# there's no double-emit; a subagent runs for minutes, so a few seconds of
+# late-starting live output costs nothing.
+_SESSION_EVENT_FALLBACK_SEC = 12.0
+
+
 def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int | None, bool, float]:
     cmd = ["claude", "--session-id", args.session_id]
 
@@ -569,6 +611,12 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     last_jsonl_poll = 0.0
     timed_out = True
     trust_sent = False
+    # Latches True once this session's transcript is confirmed to persist on
+    # disk. While it stays False (a child/subagent session Claude Code won't
+    # persist), run_tui falls back to the live terminal scrape so a
+    # --stream-session-events consumer still sees output. Checked cheaply in
+    # the JSONL poll below; once True we stop re-reading the (now growing) file.
+    session_persisted = False
     # --stream-session-events: tail Claude Code's session JSONL and echo
     # each new canonical assistant/user event live, for full downstream
     # logging (tool calls + results, not just terminal text deltas).
@@ -620,12 +668,52 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
 
                 snapshot = extract_assistant_snapshot(raw.decode("utf-8", "replace"))
                 if snapshot and snapshot != last_snapshot:
-                    # --stream-session-events supersedes terminal-scraped
-                    # text deltas with real session events (below), so don't
-                    # also emit the lower-fidelity scrape.
-                    if args.live_tui_deltas and not stream_session_events:
-                        delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
-                        if delta.strip():
+                    # --stream-session-events supersedes terminal-scraped text
+                    # deltas with real session events (below), so normally don't
+                    # also emit the lower-fidelity scrape. BUT when claude-p runs
+                    # as a nested subagent (spawned inside another Claude Code),
+                    # Claude Code does not persist the child session's transcript
+                    # to projects/**/<sid>.jsonl — only the out-of-band ai-title
+                    # lands — so the tail (_drain_session_events) emits nothing
+                    # and the downstream log stays silent even though the agent
+                    # is plainly working. Detect that (session events requested,
+                    # the transcript still isn't persisting after a grace window)
+                    # and fall back to the live terminal scrape, the same surface
+                    # the interactive screen renders. session_persisted latches
+                    # True the moment a top-level run writes its startup events,
+                    # so a normal run never reaches the fallback and never
+                    # double-emits.
+                    session_events_silent = (
+                        stream_session_events
+                        and not session_persisted
+                        and (now - start) >= _SESSION_EVENT_FALLBACK_SEC
+                    )
+                    delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
+                    if delta.strip():
+                        if session_events_silent:
+                            # Surface the scraped terminal text as a canonical
+                            # `assistant` event (not a stream_event delta): a
+                            # consumer that drives claude-p with
+                            # --stream-session-events parses the session-event
+                            # shape (assistant/user/result) and would drop a
+                            # stream_event, so the live_tui_deltas shape used
+                            # below wouldn't reach it. Emitting the incremental
+                            # delta as an assistant text block gives that
+                            # consumer live subagent output in the shape it
+                            # already understands.
+                            emit(
+                                {
+                                    "type": "assistant",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": [{"type": "text", "text": delta}],
+                                    },
+                                    "session_id": args.session_id,
+                                    "uuid": str(uuid.uuid4()),
+                                },
+                                enabled=stream_json,
+                            )
+                        elif args.live_tui_deltas and not stream_session_events:
                             emit(
                                 {
                                     "type": "stream_event",
@@ -666,6 +754,8 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                 last_jsonl_poll = now
                 if stream_session_events:
                     _drain_session_events(args.session_id, session_tail, stream_json)
+                    if not session_persisted:
+                        session_persisted = _session_transcript_is_live(args.session_id)
                 persisted = read_persisted_assistant(args.session_id)
                 if persisted and persisted.get("text") and persisted.get("terminal"):
                     timed_out = False
